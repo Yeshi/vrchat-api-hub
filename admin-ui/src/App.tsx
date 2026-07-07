@@ -1,7 +1,11 @@
-import { useState, type ReactNode } from 'react'
+import { useState, useEffect, useRef, type ReactNode } from 'react'
 
 type Track = { title: string; url: string }
 type Playlist = { name: string; tracks: Track[] }
+
+// Dev: Vite proxy forwards /api/* → localhost:5173 (no env var needed)
+// Production: set VITE_API_BASE_URL to the deployed Workers URL in Cloudflare Pages
+const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api'
 
 const EMPTY_TRACK: Track = { title: '', url: '' }
 
@@ -9,12 +13,13 @@ function Label({ children }: { children: ReactNode }) {
   return <div className="text-xs font-medium text-(--text) mb-1">{children}</div>
 }
 
-function TextInput({ value, onChange, placeholder, autoFocus, mono, large }: {
+function TextInput({ value, onChange, placeholder, autoFocus, mono, large, type = 'text' }: {
   value: string; onChange: (v: string) => void; placeholder?: string
-  autoFocus?: boolean; mono?: boolean; large?: boolean
+  autoFocus?: boolean; mono?: boolean; large?: boolean; type?: string
 }) {
   return (
     <input
+      type={type}
       autoFocus={autoFocus}
       value={value}
       onChange={e => onChange(e.target.value)}
@@ -48,9 +53,54 @@ function Btn({ onClick, children, variant = 'ghost', disabled, title, small }: {
   )
 }
 
+function PasswordGate({ onAuth }: { onAuth: (token: string) => void }) {
+  const [input, setInput] = useState('')
+  return (
+    <div className="flex flex-col flex-1 items-center justify-center">
+      <div className="w-72 space-y-4">
+        <div className="text-sm font-semibold text-(--text-h)">Admin Access</div>
+        <TextInput
+          autoFocus
+          type="password"
+          value={input}
+          onChange={setInput}
+          placeholder="Token"
+        />
+        <Btn variant="primary" onClick={() => input && onAuth(input)}>Enter</Btn>
+      </div>
+    </div>
+  )
+}
+
+type Status = 'loading' | 'ready' | 'saving' | 'saved' | 'error'
+
+const STATUS_LABEL: Record<Status, string> = {
+  loading: 'Loading...',
+  ready: '',
+  saving: 'Saving...',
+  saved: '✓ Saved',
+  error: '⚠ Error',
+}
+
 export default function App() {
+  const [token, setToken] = useState(() => localStorage.getItem('admin_token') ?? '')
+
+  function login(t: string) {
+    localStorage.setItem('admin_token', t)
+    setToken(t)
+  }
+  function logout() {
+    localStorage.removeItem('admin_token')
+    setToken('')
+  }
+
   const [playlists, setPlaylists] = useState<Playlist[]>([])
   const [selectedPl, setSelectedPl] = useState<number | null>(null)
+  const [status, setStatus] = useState<Status>('loading')
+
+  // Ref to the playlists array that was last fetched or saved.
+  // When playlists === lastSynced.current (same reference), the data is clean — no save needed.
+  const lastSynced = useRef<Playlist[] | null>(null)
 
   // Track editing state
   const [editingTrack, setEditingTrack] = useState<number | null>(null)
@@ -58,6 +108,46 @@ export default function App() {
   const [addingTrack, setAddingTrack] = useState(false)
   const [addTrackDraft, setAddTrackDraft] = useState<Track>(EMPTY_TRACK)
   const [copied, setCopied] = useState(false)
+
+  // ── Load on mount ─────────────────────────────────────────
+  useEffect(() => {
+    fetch(`${API_BASE}/playlists`)
+      .then(r => r.json() as Promise<{ playlists: Playlist[] }>)
+      .then(data => {
+        const loaded = data.playlists ?? []
+        lastSynced.current = loaded
+        setPlaylists(loaded)
+        setStatus('ready')
+      })
+      .catch(() => setStatus('error'))
+  }, [])
+
+  // ── Debounced auto-save ───────────────────────────────────
+  useEffect(() => {
+    // Skip if not yet loaded, or if this change came from the load itself
+    if (lastSynced.current === null) return
+    if (playlists === lastSynced.current) return
+
+    setStatus('saving')
+    const t = setTimeout(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/playlists`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`,
+          },
+          body: JSON.stringify({ playlists }),
+        })
+        if (res.status === 401) { logout(); return }
+        lastSynced.current = playlists
+        setStatus('saved')
+      } catch {
+        setStatus('error')
+      }
+    }, 800)
+    return () => clearTimeout(t)
+  }, [playlists])
 
   // ── Playlist operations ──────────────────────────────────
   function addPlaylist() {
@@ -142,15 +232,37 @@ export default function App() {
   const json = JSON.stringify({ playlists }, null, 2)
   const selected = selectedPl !== null ? playlists[selectedPl] : null
 
+  if (!token) return <PasswordGate onAuth={login} />
+
   return (
     <div className="flex flex-col flex-1">
       {/* ── Header ─────────────────────────────────────── */}
       <header className="px-6 py-4 border-b border-(--border) flex items-center gap-2.5 shrink-0">
         <span className="w-2 h-2 rounded-full bg-(--accent) shrink-0" />
         <span className="text-sm font-semibold text-(--text-h) tracking-tight">Playlist Editor</span>
+        {STATUS_LABEL[status] && (
+          <span className={`text-xs ${status === 'error' ? 'text-red-500' : 'text-(--text)'}`}>
+            {STATUS_LABEL[status]}
+          </span>
+        )}
+        <button
+          onClick={logout}
+          className="ml-auto text-xs text-(--text) hover:text-red-500 transition-colors"
+          title="ログアウト"
+        >
+          Logout
+        </button>
       </header>
 
-      <div className="flex flex-1">
+      {status === 'loading' && (
+        <div className="flex flex-1 items-center justify-center text-sm text-(--text)">Loading...</div>
+      )}
+      {status === 'error' && lastSynced.current === null && (
+        <div className="flex flex-1 items-center justify-center text-sm text-red-500">
+          API に接続できません。api dev サーバーが起動しているか確認してください。
+        </div>
+      )}
+      <div className={`flex flex-1 ${status === 'loading' ? 'hidden' : ''}`}>
         {/* ── Sidebar ──────────────────────────────────── */}
         <aside className="w-56 border-r border-(--border) flex flex-col shrink-0">
           <div className="px-4 py-3 border-b border-(--border) flex items-center gap-2">

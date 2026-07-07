@@ -1,0 +1,12 @@
+# Node
+node_modules/
+.DS_Store
+
+# Env / secrets
+.env
+.env.production
+.env.development
+.dev.vars
+
+# Build
+dist/

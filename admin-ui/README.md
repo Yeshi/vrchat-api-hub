@@ -1,73 +1,91 @@
-# React + TypeScript + Vite
+# admin-ui
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Playlist editor — React + TypeScript + Vite.  
+Cloudflare Workers (`../api`) にプレイリストデータを保存・読み出しするフロントエンド。
 
-Currently, two official plugins are available:
+---
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## ローカル開発
 
-## React Compiler
+2 つのサーバーを別々のターミナルで起動する。
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+```bash
+# ターミナル 1 — API サーバー (port 5173)
+cd ../api
+npm run dev
 
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+# ターミナル 2 — Admin UI (port 5174)
+npm run dev
+# → http://localhost:5174
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+Vite の dev proxy が `/api/*` を `localhost:5173` に転送するので、  
+ローカルでは環境変数の設定は不要。
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+---
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+## 環境変数
+
+| 変数名 | 説明 | 例 |
+|---|---|---|
+| `VITE_API_BASE_URL` | 本番 Workers の URL | `https://api.your-account.workers.dev` |
+
+ローカルでは未設定でよい（デフォルトで `/api` プロキシを使用）。
+
+`.env.example` をコピーして `.env.local` を作れば個別に上書きできる。
+
+```bash
+cp .env.example .env.local
+# .env.local を編集
 ```
+
+---
+
+## Cloudflare Pages へのデプロイ
+
+### 1. ビルド確認
+
+```bash
+npm run build
+# → dist/ に出力される
+```
+
+### 2-A. CLI でデプロイ（推奨）
+
+```bash
+npm run build
+npx wrangler pages deploy dist --project-name=admin-ui
+```
+
+初回は対話形式でプロジェクトが作成される。
+
+### 2-B. ダッシュボードから Git 連携でデプロイ
+
+Cloudflare Pages ダッシュボード → **Create application** → **Connect to Git**
+
+| 設定項目 | 値 |
+|---|---|
+| Framework preset | Vite |
+| Build command | `npm run build` |
+| Build output directory | `dist` |
+| Root directory | `admin-ui` |
+
+### 3. 環境変数を Pages に設定
+
+Pages ダッシュボード → Settings → Environment variables → **Production**
+
+```
+VITE_API_BASE_URL = https://api.your-account.workers.dev
+```
+
+`VITE_` プレフィックスが必要（Vite がビルド時に埋め込む）。  
+設定後、再デプロイ（Retry deployment）すること。
+
+---
+
+## API エンドポイント
+
+| Method | Path | 説明 |
+|---|---|---|
+| `GET` | `/playlists` | 全プレイリストを取得 |
+| `PUT` | `/playlists` | 全プレイリストを上書き保存 |

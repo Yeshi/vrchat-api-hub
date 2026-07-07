@@ -2,5 +2,11 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "api",
   "compatibility_date": "2025-08-03",
-  "main": "./src/index.tsx"
+  "main": "./src/index.tsx",
+  "kv_namespaces": [
+    {
+      "binding": "PLAYLIST_STORE",
+      "id": "e612c2d5f5754488abbf8d6b8d9ab781"
+    }
+  ]
 }
