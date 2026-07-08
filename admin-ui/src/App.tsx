@@ -1,13 +1,37 @@
-import { useState, useEffect, useRef, type ReactNode } from 'react'
+import { useState, useEffect, useRef, useCallback, type ReactNode } from 'react'
+
+// ── Types ─────────────────────────────────────────────────────────
 
 type Track = { title: string; url: string }
 type Playlist = { name: string; tracks: Track[] }
+type PlaylistData = { playlists: Playlist[] }
+
+type ApiConfig = {
+  id: string
+  name: string
+  type: 'playlist'
+  url: string
+  createdAt: string
+}
+
+type Page = { view: 'list' } | { view: 'create' } | { view: 'detail'; config: ApiConfig }
+type Status = 'loading' | 'ready' | 'saving' | 'saved' | 'error'
 
 // Dev: Vite proxy forwards /api/* → localhost:5173 (no env var needed)
-// Production: set VITE_API_BASE_URL to the deployed Workers URL in Cloudflare Pages
+// Production: set VITE_API_BASE_URL to the deployed Workers URL
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api'
 
 const EMPTY_TRACK: Track = { title: '', url: '' }
+
+const STATUS_LABEL: Record<Status, string> = {
+  loading: 'Loading...',
+  ready: '',
+  saving: 'Saving...',
+  saved: '✓ Saved',
+  error: '⚠ Error',
+}
+
+// ── UI Primitives ─────────────────────────────────────────────────
 
 function Label({ children }: { children: ReactNode }) {
   return <div className="text-xs font-medium text-(--text) mb-1">{children}</div>
@@ -72,117 +96,64 @@ function PasswordGate({ onAuth }: { onAuth: (token: string) => void }) {
   )
 }
 
-type Status = 'loading' | 'ready' | 'saving' | 'saved' | 'error'
+// ── Playlist Editor ───────────────────────────────────────────────
+// Self-contained playlist CRUD UI.
+// Calls onChange on every user edit (parent is responsible for debounce + save).
 
-const STATUS_LABEL: Record<Status, string> = {
-  loading: 'Loading...',
-  ready: '',
-  saving: 'Saving...',
-  saved: '✓ Saved',
-  error: '⚠ Error',
-}
-
-export default function App() {
-  const [token, setToken] = useState(() => localStorage.getItem('admin_token') ?? '')
-
-  function login(t: string) {
-    localStorage.setItem('admin_token', t)
-    setToken(t)
-  }
-  function logout() {
-    localStorage.removeItem('admin_token')
-    setToken('')
-  }
-
-  const [playlists, setPlaylists] = useState<Playlist[]>([])
+function PlaylistEditor({
+  initialData,
+  onChange,
+}: {
+  initialData: PlaylistData
+  onChange: (data: PlaylistData) => void
+}) {
+  const [playlists, setPlaylists] = useState<Playlist[]>(() => initialData.playlists)
   const [selectedPl, setSelectedPl] = useState<number | null>(null)
-  const [status, setStatus] = useState<Status>('loading')
-
-  // Ref to the playlists array that was last fetched or saved.
-  // When playlists === lastSynced.current (same reference), the data is clean — no save needed.
-  const lastSynced = useRef<Playlist[] | null>(null)
-
-  // Track editing state
   const [editingTrack, setEditingTrack] = useState<number | null>(null)
   const [editTrackDraft, setEditTrackDraft] = useState<Track>(EMPTY_TRACK)
   const [addingTrack, setAddingTrack] = useState(false)
   const [addTrackDraft, setAddTrackDraft] = useState<Track>(EMPTY_TRACK)
   const [copied, setCopied] = useState(false)
 
-  // ── Load on mount ─────────────────────────────────────────
-  useEffect(() => {
-    fetch(`${API_BASE}/playlists`)
-      .then(r => r.json() as Promise<{ playlists: Playlist[] }>)
-      .then(data => {
-        const loaded = data.playlists ?? []
-        lastSynced.current = loaded
-        setPlaylists(loaded)
-        setStatus('ready')
-      })
-      .catch(() => setStatus('error'))
-  }, [])
+  // Notify parent on every user-driven playlists change
+  function update(next: Playlist[]) {
+    setPlaylists(next)
+    onChange({ playlists: next })
+  }
 
-  // ── Debounced auto-save ───────────────────────────────────
-  useEffect(() => {
-    // Skip if not yet loaded, or if this change came from the load itself
-    if (lastSynced.current === null) return
-    if (playlists === lastSynced.current) return
-
-    setStatus('saving')
-    const t = setTimeout(async () => {
-      try {
-        const res = await fetch(`${API_BASE}/playlists`, {
-          method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${token}`,
-          },
-          body: JSON.stringify({ playlists }),
-        })
-        if (res.status === 401) { logout(); return }
-        lastSynced.current = playlists
-        setStatus('saved')
-      } catch {
-        setStatus('error')
-      }
-    }, 800)
-    return () => clearTimeout(t)
-  }, [playlists])
-
-  // ── Playlist operations ──────────────────────────────────
+  // ── Playlist operations ────────────────────────────────────────
   function addPlaylist() {
-    setPlaylists(ps => [...ps, { name: '', tracks: [] }])
-    setSelectedPl(playlists.length)
+    const next = [...playlists, { name: '', tracks: [] }]
+    setSelectedPl(next.length - 1)
     setEditingTrack(null)
     setAddingTrack(false)
+    update(next)
   }
 
   function deletePlaylist(i: number) {
-    setPlaylists(ps => ps.filter((_, j) => j !== i))
+    update(playlists.filter((_, j) => j !== i))
     if (selectedPl === i) setSelectedPl(null)
     else if (selectedPl !== null && selectedPl > i) setSelectedPl(selectedPl - 1)
   }
 
   function renamePlaylist(i: number, name: string) {
-    setPlaylists(ps => ps.map((p, j) => (j === i ? { ...p, name } : p)))
+    update(playlists.map((p, j) => (j === i ? { ...p, name } : p)))
   }
 
   function movePlaylist(i: number, dir: -1 | 1) {
     const next = i + dir
     if (next < 0 || next >= playlists.length) return
-    setPlaylists(ps => {
-      const arr = [...ps]
-      ;[arr[i], arr[next]] = [arr[next], arr[i]]
-      return arr
-    })
+    const arr = [...playlists]
+    ;[arr[i], arr[next]] = [arr[next], arr[i]]
+    update(arr)
     if (selectedPl === i) setSelectedPl(next)
     else if (selectedPl === next) setSelectedPl(i)
   }
 
-  // ── Track operations (on selected playlist) ──────────────
+  // ── Track operations ───────────────────────────────────────────
   function updateTracks(fn: (ts: Track[]) => Track[]) {
     if (selectedPl === null) return
-    setPlaylists(ps => ps.map((p, i) => (i === selectedPl ? { ...p, tracks: fn(p.tracks) } : p)))
+    update(playlists.map((p, i) => (i === selectedPl ? { ...p, tracks: fn(p.tracks) } : p)))
   }
 
   function startEditTrack(i: number) {
@@ -224,45 +195,16 @@ export default function App() {
   }
 
   async function copyJson() {
-    await navigator.clipboard.writeText(json)
+    await navigator.clipboard.writeText(JSON.stringify({ playlists }, null, 2))
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
   }
 
-  const json = JSON.stringify({ playlists }, null, 2)
   const selected = selectedPl !== null ? playlists[selectedPl] : null
 
-  if (!token) return <PasswordGate onAuth={login} />
-
   return (
-    <div className="flex flex-col flex-1">
-      {/* ── Header ─────────────────────────────────────── */}
-      <header className="px-6 py-4 border-b border-(--border) flex items-center gap-2.5 shrink-0">
-        <span className="w-2 h-2 rounded-full bg-(--accent) shrink-0" />
-        <span className="text-sm font-semibold text-(--text-h) tracking-tight">Playlist Editor</span>
-        {STATUS_LABEL[status] && (
-          <span className={`text-xs ${status === 'error' ? 'text-red-500' : 'text-(--text)'}`}>
-            {STATUS_LABEL[status]}
-          </span>
-        )}
-        <button
-          onClick={logout}
-          className="ml-auto text-xs text-(--text) hover:text-red-500 transition-colors"
-          title="ログアウト"
-        >
-          Logout
-        </button>
-      </header>
-
-      {status === 'loading' && (
-        <div className="flex flex-1 items-center justify-center text-sm text-(--text)">Loading...</div>
-      )}
-      {status === 'error' && lastSynced.current === null && (
-        <div className="flex flex-1 items-center justify-center text-sm text-red-500">
-          API に接続できません。api dev サーバーが起動しているか確認してください。
-        </div>
-      )}
-      <div className={`flex flex-1 ${status === 'loading' ? 'hidden' : ''}`}>
+    <div className="flex flex-col flex-1 min-h-0">
+      <div className="flex flex-1 min-h-0">
         {/* ── Sidebar ──────────────────────────────────── */}
         <aside className="w-56 border-r border-(--border) flex flex-col shrink-0">
           <div className="px-4 py-3 border-b border-(--border) flex items-center gap-2">
@@ -271,7 +213,6 @@ export default function App() {
               {playlists.length}
             </span>
           </div>
-
           <ul className="flex-1 overflow-y-auto py-1">
             {playlists.length === 0 && (
               <li className="px-4 py-6 text-xs text-(--text) text-center">No playlists yet</li>
@@ -304,7 +245,6 @@ export default function App() {
               </li>
             ))}
           </ul>
-
           <div className="p-3 border-t border-(--border)">
             <button
               onClick={addPlaylist}
@@ -316,7 +256,7 @@ export default function App() {
         </aside>
 
         {/* ── Detail Panel ─────────────────────────────── */}
-        <main className="flex-1 p-6 space-y-8 min-w-0">
+        <main className="flex-1 p-6 space-y-8 min-w-0 overflow-y-auto">
           {selected === null ? (
             <div className="h-full flex items-center justify-center">
               <div className="text-center space-y-3">
@@ -328,7 +268,6 @@ export default function App() {
             </div>
           ) : (
             <>
-              {/* Playlist name */}
               <section>
                 <Label>Playlist Name</Label>
                 <TextInput
@@ -339,7 +278,6 @@ export default function App() {
                 />
               </section>
 
-              {/* Tracks */}
               <section>
                 <div className="flex items-center gap-2 mb-3">
                   <span className="text-sm font-semibold text-(--text-h)">Tracks</span>
@@ -423,9 +361,403 @@ export default function App() {
           <Btn variant="outline" small onClick={copyJson}>{copied ? '✓ Copied' : 'Copy'}</Btn>
         </div>
         <pre className="p-4 bg-(--code-bg) border border-(--border) rounded-lg text-xs font-mono text-(--text-h) overflow-x-auto leading-relaxed max-h-64 overflow-y-auto">
-          {json}
+          {JSON.stringify({ playlists }, null, 2)}
         </pre>
       </section>
+    </div>
+  )
+}
+
+// ── API List Page ─────────────────────────────────────────────────
+
+function ApiListPage({
+  token,
+  onSelect,
+  onCreate,
+  onUnauth,
+}: {
+  token: string
+  onSelect: (config: ApiConfig) => void
+  onCreate: () => void
+  onUnauth: () => void
+}) {
+  const [apis, setApis] = useState<ApiConfig[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(false)
+  const [deleting, setDeleting] = useState<string | null>(null)
+
+  useEffect(() => {
+    fetch(`${API_BASE}/admin/apis`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then(async r => {
+        if (r.status === 401) { onUnauth(); return }
+        const data = await r.json() as { apis: ApiConfig[] }
+        setApis(data.apis ?? [])
+        setLoading(false)
+      })
+      .catch(() => { setError(true); setLoading(false) })
+  }, [])
+
+  async function deleteApi(id: string) {
+    if (!confirm('このAPIを削除しますか？データも削除されます。')) return
+    setDeleting(id)
+    try {
+      const res = await fetch(`${API_BASE}/admin/apis/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (res.status === 401) { onUnauth(); return }
+      setApis(prev => prev.filter(a => a.id !== id))
+    } finally {
+      setDeleting(null)
+    }
+  }
+
+  if (loading) {
+    return <div className="flex flex-1 items-center justify-center text-sm text-(--text)">Loading...</div>
+  }
+  if (error) {
+    return <div className="flex flex-1 items-center justify-center text-sm text-red-500">API に接続できません</div>
+  }
+
+  return (
+    <div className="flex-1 p-6 min-w-0">
+      <div className="flex items-center justify-between mb-6">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-semibold text-(--text-h)">APIs</span>
+          <span className="text-xs text-(--text) bg-(--code-bg) border border-(--border) px-1.5 py-0.5 rounded-full leading-none">
+            {apis.length}
+          </span>
+        </div>
+        <Btn variant="primary" onClick={onCreate}>+ New API</Btn>
+      </div>
+
+      {apis.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-24 gap-4">
+          <div className="text-(--text) text-sm">まだ API がありません</div>
+          <Btn variant="outline" onClick={onCreate}>最初の API を作成する</Btn>
+        </div>
+      ) : (
+        <div className="border border-(--border) rounded-lg overflow-hidden">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="bg-(--code-bg) border-b border-(--border)">
+                <th className="px-4 py-2.5 text-left text-xs font-medium text-(--text)">Name</th>
+                <th className="px-4 py-2.5 text-left text-xs font-medium text-(--text)">Type</th>
+                <th className="px-4 py-2.5 text-left text-xs font-medium text-(--text)">URL</th>
+                <th className="px-4 py-2.5 text-left text-xs font-medium text-(--text)">Created</th>
+                <th className="px-4 py-2.5" />
+              </tr>
+            </thead>
+            <tbody>
+              {apis.map((api, i) => (
+                <tr
+                  key={api.id}
+                  className={`border-b border-(--border) last:border-0 ${i % 2 === 0 ? '' : 'bg-(--code-bg)/40'}`}
+                >
+                  <td className="px-4 py-3 font-medium text-(--text-h)">{api.name}</td>
+                  <td className="px-4 py-3">
+                    <span className="text-xs bg-(--accent-bg) text-(--accent) px-2 py-0.5 rounded-full font-medium">
+                      {api.type}
+                    </span>
+                  </td>
+                  <td className="px-4 py-3 font-mono text-xs text-(--text)">/{api.url}</td>
+                  <td className="px-4 py-3 text-xs text-(--text)">
+                    {new Date(api.createdAt).toLocaleDateString('ja-JP')}
+                  </td>
+                  <td className="px-4 py-3">
+                    <div className="flex items-center gap-1 justify-end">
+                      <Btn small variant="outline" onClick={() => onSelect(api)}>Edit</Btn>
+                      <Btn
+                        small
+                        variant="danger"
+                        disabled={deleting === api.id}
+                        onClick={() => deleteApi(api.id)}
+                      >
+                        Delete
+                      </Btn>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── API Create Page ───────────────────────────────────────────────
+
+function ApiCreatePage({
+  token,
+  onCreated,
+  onBack,
+  onUnauth,
+}: {
+  token: string
+  onCreated: (config: ApiConfig) => void
+  onBack: () => void
+  onUnauth: () => void
+}) {
+  const [name, setName] = useState('')
+  const [url, setUrl] = useState('')
+  const [urlError, setUrlError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+
+  function sanitizeUrl(v: string) {
+    return v.toLowerCase().replace(/[^a-z0-9-_]/g, '-').replace(/--+/g, '-').replace(/^-|-$/g, '')
+  }
+
+  async function handleCreate() {
+    if (!name.trim() || !url.trim()) return
+    setSubmitting(true)
+    setUrlError('')
+    try {
+      const res = await fetch(`${API_BASE}/admin/apis`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ name: name.trim(), type: 'playlist', url: url.trim() }),
+      })
+      if (res.status === 401) { onUnauth(); return }
+      if (res.status === 409) { setUrlError('この URL は既に使用されています'); return }
+      const created = await res.json() as ApiConfig
+      onCreated(created)
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const publicUrl = `${API_BASE}/${url || '<slug>'}`
+
+  return (
+    <div className="flex-1 p-6 max-w-lg">
+      <button
+        onClick={onBack}
+        className="text-xs text-(--text) hover:text-(--text-h) transition-colors mb-6 flex items-center gap-1"
+      >
+        ← Back
+      </button>
+
+      <div className="text-base font-semibold text-(--text-h) mb-6">New API</div>
+
+      <div className="space-y-5">
+        <div>
+          <Label>Name</Label>
+          <TextInput autoFocus value={name} onChange={setName} placeholder="VRChat Playlist" />
+        </div>
+
+        <div>
+          <Label>Type</Label>
+          <div className="px-3 py-2 text-sm border border-(--border) rounded-lg text-(--text-h) bg-(--code-bg) cursor-default">
+            Playlist
+          </div>
+        </div>
+
+        <div>
+          <Label>URL Slug</Label>
+          <TextInput
+            mono
+            value={url}
+            onChange={v => { setUrl(sanitizeUrl(v)); setUrlError('') }}
+            placeholder="playlists"
+          />
+          {urlError ? (
+            <div className="text-xs text-red-500 mt-1">{urlError}</div>
+          ) : url ? (
+            <div className="text-xs text-(--text) mt-1 font-mono">{publicUrl}</div>
+          ) : null}
+        </div>
+
+        <div className="flex gap-2 pt-2">
+          <Btn variant="primary" disabled={!name.trim() || !url.trim() || submitting} onClick={handleCreate}>
+            {submitting ? 'Creating...' : 'Create API'}
+          </Btn>
+          <Btn variant="outline" onClick={onBack}>Cancel</Btn>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── API Detail Page ───────────────────────────────────────────────
+
+function ApiDetailPage({
+  config,
+  token,
+  onBack,
+  onUnauth,
+  onStatus,
+}: {
+  config: ApiConfig
+  token: string
+  onBack: () => void
+  onUnauth: () => void
+  onStatus: (s: Status) => void
+}) {
+  const [data, setData] = useState<PlaylistData | null>(null)
+  const [loadError, setLoadError] = useState(false)
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [urlCopied, setUrlCopied] = useState(false)
+
+  useEffect(() => {
+    onStatus('loading')
+    fetch(`${API_BASE}/admin/apis/${config.id}/data`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then(async r => {
+        if (r.status === 401) { onUnauth(); return }
+        const d = await r.json() as PlaylistData
+        setData(d)
+        onStatus('ready')
+      })
+      .catch(() => { setLoadError(true); onStatus('error') })
+  }, [config.id])
+
+  const handleChange = useCallback((newData: PlaylistData) => {
+    onStatus('saving')
+    if (saveTimer.current) clearTimeout(saveTimer.current)
+    saveTimer.current = setTimeout(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/admin/apis/${config.id}/data`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(newData),
+        })
+        if (res.status === 401) { onUnauth(); return }
+        onStatus('saved')
+      } catch {
+        onStatus('error')
+      }
+    }, 800)
+  }, [config.id, token])
+
+  async function copyPublicUrl() {
+    await navigator.clipboard.writeText(`${API_BASE}/${config.url}`)
+    setUrlCopied(true)
+    setTimeout(() => setUrlCopied(false), 2000)
+  }
+
+  return (
+    <div className="flex flex-col flex-1 min-h-0">
+      {/* ── Config bar ───────────────────────────────────── */}
+      <div className="px-6 py-3 border-b border-(--border) flex items-center gap-4 shrink-0 flex-wrap">
+        <button
+          onClick={onBack}
+          className="text-xs text-(--text) hover:text-(--text-h) transition-colors flex items-center gap-1 shrink-0"
+        >
+          ← APIs
+        </button>
+        <span className="text-sm font-semibold text-(--text-h)">{config.name}</span>
+        <span className="text-xs bg-(--accent-bg) text-(--accent) px-2 py-0.5 rounded-full font-medium shrink-0">
+          {config.type}
+        </span>
+        <div className="flex items-center gap-1.5 ml-auto">
+          <span className="text-xs font-mono text-(--text)">GET /{config.url}</span>
+          <button
+            onClick={copyPublicUrl}
+            className="text-xs text-(--text) hover:text-(--accent) transition-colors px-2 py-0.5 border border-(--border) rounded"
+          >
+            {urlCopied ? '✓' : 'Copy URL'}
+          </button>
+        </div>
+      </div>
+
+      {loadError && (
+        <div className="flex flex-1 items-center justify-center text-sm text-red-500">
+          データを読み込めませんでした
+        </div>
+      )}
+
+      {!loadError && data === null && (
+        <div className="flex flex-1 items-center justify-center text-sm text-(--text)">Loading...</div>
+      )}
+
+      {data !== null && (
+        <PlaylistEditor initialData={data} onChange={handleChange} />
+      )}
+    </div>
+  )
+}
+
+// ── App (root) ────────────────────────────────────────────────────
+
+export default function App() {
+  const [token, setToken] = useState(() => localStorage.getItem('admin_token') ?? '')
+  const [page, setPage] = useState<Page>({ view: 'list' })
+  const [status, setStatus] = useState<Status>('ready')
+
+  function login(t: string) {
+    localStorage.setItem('admin_token', t)
+    setToken(t)
+  }
+  function logout() {
+    localStorage.removeItem('admin_token')
+    setToken('')
+  }
+
+  if (!token) return <PasswordGate onAuth={login} />
+
+  return (
+    <div className="flex flex-col flex-1 min-h-0">
+      {/* ── Header ─────────────────────────────────────── */}
+      <header className="px-6 py-4 border-b border-(--border) flex items-center gap-2.5 shrink-0">
+        <span className="w-2 h-2 rounded-full bg-(--accent) shrink-0" />
+        <button
+          onClick={() => { setPage({ view: 'list' }); setStatus('ready') }}
+          className="text-sm font-semibold text-(--text-h) tracking-tight hover:text-(--accent) transition-colors"
+        >
+          API Manager
+        </button>
+        {STATUS_LABEL[status] && page.view === 'detail' && (
+          <span className={`text-xs ${status === 'error' ? 'text-red-500' : 'text-(--text)'}`}>
+            {STATUS_LABEL[status]}
+          </span>
+        )}
+        <button
+          onClick={logout}
+          className="ml-auto text-xs text-(--text) hover:text-red-500 transition-colors"
+        >
+          Logout
+        </button>
+      </header>
+
+      {/* ── Page content ───────────────────────────────── */}
+      {page.view === 'list' && (
+        <ApiListPage
+          token={token}
+          onSelect={config => { setPage({ view: 'detail', config }); setStatus('loading') }}
+          onCreate={() => setPage({ view: 'create' })}
+          onUnauth={logout}
+        />
+      )}
+
+      {page.view === 'create' && (
+        <ApiCreatePage
+          token={token}
+          onCreated={config => { setPage({ view: 'detail', config }); setStatus('loading') }}
+          onBack={() => setPage({ view: 'list' })}
+          onUnauth={logout}
+        />
+      )}
+
+      {page.view === 'detail' && (
+        <ApiDetailPage
+          config={page.config}
+          token={token}
+          onBack={() => { setPage({ view: 'list' }); setStatus('ready') }}
+          onUnauth={logout}
+          onStatus={setStatus}
+        />
+      )}
     </div>
   )
 }
