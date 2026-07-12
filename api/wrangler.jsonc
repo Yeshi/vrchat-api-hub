@@ -8,5 +8,12 @@
       "binding": "PLAYLIST_STORE",
       "id": "e612c2d5f5754488abbf8d6b8d9ab781"
     }
+  ],
+  "d1_databases": [
+    {
+      "binding": "HEALTH_DB",
+      "database_name": "vrchat-health-db",
+      "database_id": "56affbb3-4abe-413b-b1e5-b93f57545961"
+    }
   ]
 }
