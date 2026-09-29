@@ -6,11 +6,24 @@ type Track = { title: string; url: string }
 type Playlist = { name: string; tracks: Track[] }
 type PlaylistData = { playlists: Playlist[] }
 
+// VRChat (Udon) cannot build a VRCUrl from a runtime string, so the world bakes
+// fixed slot URLs (/{slug}/v/0 … /{slug}/v/{slotCount - 1}) and this API
+// redirects each one to the real video URL. Slots are numbered sequentially across
+// all playlists in display order. slotCount is set per API (= number of URLs baked).
+const DEFAULT_SLOT_COUNT = 20
+type SlotTrack = { slot: number; title: string; empty: boolean }
+type PlaylistMetadata = {
+  slotCount: number
+  usedSlots: number
+  playlists: { name: string; tracks: SlotTrack[] }[]
+}
+
 type ApiConfig = {
   id: string
   name: string
   type: 'playlist'
   url: string
+  slotCount?: number // missing on APIs created before per-API slot counts → DEFAULT_SLOT_COUNT
   createdAt: string
 }
 type ApiRegistry = { apis: ApiConfig[] }
@@ -28,7 +41,7 @@ type AppBindings = CloudflareBindings & { PLAYLIST_AUTH_TOKEN?: string; HEALTH_A
 const app = new Hono<{ Bindings: AppBindings }>()
 
 app.use(renderer)
-app.use('*', cors({ origin: '*', allowMethods: ['GET', 'PUT', 'POST', 'DELETE', 'OPTIONS'] }))
+app.use('*', cors({ origin: '*', allowMethods: ['GET', 'PUT', 'POST', 'PATCH', 'DELETE', 'OPTIONS'] }))
 
 function generateId(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
@@ -36,6 +49,51 @@ function generateId(): string {
 
 function authed(secret: string | undefined, auth: string | null | undefined): boolean {
   return !!secret && auth === `Bearer ${secret}`
+}
+
+function countTracks(data: PlaylistData): number {
+  return data.playlists.reduce((sum, p) => sum + p.tracks.length, 0)
+}
+
+function isPlayableUrl(url: string): boolean {
+  return /^https?:\/\/\S+$/.test(url)
+}
+
+function slotCountOf(config: ApiConfig | undefined): number {
+  return config?.slotCount ?? DEFAULT_SLOT_COUNT
+}
+
+function isValidSlotCount(v: unknown): v is number {
+  return typeof v === 'number' && Number.isSafeInteger(v) && v >= 1
+}
+
+async function loadPlaylist(
+  env: AppBindings,
+  slug: string,
+): Promise<{ data: PlaylistData; slotCount: number } | null> {
+  const registry = (await env.PLAYLIST_STORE.get<ApiRegistry>('api_registry', 'json')) ?? { apis: [] }
+  const apiConfig = registry.apis.find(a => a.url === slug)
+
+  if (!apiConfig) {
+    // Legacy fallback: serve from old 'playlists' key before migration
+    if (slug === 'playlists') {
+      const data = (await env.PLAYLIST_STORE.get<PlaylistData>('playlists', 'json')) ?? { playlists: [] }
+      return { data, slotCount: DEFAULT_SLOT_COUNT }
+    }
+    return null
+  }
+
+  const data = (await env.PLAYLIST_STORE.get<PlaylistData>(`data:${apiConfig.id}`, 'json')) ?? { playlists: [] }
+  return { data, slotCount: slotCountOf(apiConfig) }
+}
+
+function toMetadata(data: PlaylistData, slotCount: number): PlaylistMetadata {
+  let slot = 0
+  const playlists = data.playlists.map(p => ({
+    name: p.name,
+    tracks: p.tracks.map(t => ({ slot: slot++, title: t.title, empty: !isPlayableUrl(t.url) })),
+  }))
+  return { slotCount, usedSlots: slot, playlists }
 }
 
 // ── System routes ─────────────────────────────────────────────────
@@ -71,7 +129,9 @@ app.post('/admin/apis', async (c) => {
   if (!authed(c.env.PLAYLIST_AUTH_TOKEN, c.req.header('Authorization')))
     return c.json({ error: 'Unauthorized' }, 401)
 
-  const body = await c.req.json<{ name: string; type: 'playlist'; url: string }>()
+  const body = await c.req.json<{ name: string; type: 'playlist'; url: string; slotCount?: number }>()
+  if (body.slotCount !== undefined && !isValidSlotCount(body.slotCount))
+    return c.json({ error: '"slotCount" must be a positive integer' }, 400)
   const registry = (await c.env.PLAYLIST_STORE.get<ApiRegistry>('api_registry', 'json')) ?? { apis: [] }
 
   if (registry.apis.some(a => a.url === body.url))
@@ -82,6 +142,7 @@ app.post('/admin/apis', async (c) => {
     name: body.name,
     type: body.type,
     url: body.url,
+    slotCount: body.slotCount ?? DEFAULT_SLOT_COUNT,
     createdAt: new Date().toISOString(),
   }
   registry.apis.push(newApi)
@@ -108,11 +169,41 @@ app.put('/admin/apis/:id/data', async (c) => {
 
   const id = c.req.param('id')
   const registry = (await c.env.PLAYLIST_STORE.get<ApiRegistry>('api_registry', 'json')) ?? { apis: [] }
-  if (!registry.apis.some(a => a.id === id)) return c.json({ error: 'Not found' }, 404)
+  const apiConfig = registry.apis.find(a => a.id === id)
+  if (!apiConfig) return c.json({ error: 'Not found' }, 404)
 
-  const body = await c.req.json()
+  const body = await c.req.json<PlaylistData>()
+  if (!Array.isArray(body?.playlists) || body.playlists.some(p => !Array.isArray(p?.tracks)))
+    return c.json({ error: 'Invalid playlist data' }, 400)
+  const slotCount = slotCountOf(apiConfig)
+  if (countTracks(body) > slotCount)
+    return c.json({ error: `Total tracks must not exceed ${slotCount}` }, 400)
+
   await c.env.PLAYLIST_STORE.put(`data:${id}`, JSON.stringify(body))
   return c.json({ ok: true })
+})
+
+app.patch('/admin/apis/:id', async (c) => {
+  if (!authed(c.env.PLAYLIST_AUTH_TOKEN, c.req.header('Authorization')))
+    return c.json({ error: 'Unauthorized' }, 401)
+
+  const id = c.req.param('id')
+  const registry = (await c.env.PLAYLIST_STORE.get<ApiRegistry>('api_registry', 'json')) ?? { apis: [] }
+  const apiConfig = registry.apis.find(a => a.id === id)
+  if (!apiConfig) return c.json({ error: 'Not found' }, 404)
+
+  const body = await c.req.json<{ slotCount?: unknown }>()
+  if (!isValidSlotCount(body.slotCount))
+    return c.json({ error: '"slotCount" must be a positive integer' }, 400)
+
+  const data = (await c.env.PLAYLIST_STORE.get<PlaylistData>(`data:${id}`, 'json')) ?? { playlists: [] }
+  const used = countTracks(data)
+  if (body.slotCount < used)
+    return c.json({ error: `"slotCount" must be at least the current track count (${used})` }, 409)
+
+  apiConfig.slotCount = body.slotCount
+  await c.env.PLAYLIST_STORE.put('api_registry', JSON.stringify(registry))
+  return c.json(apiConfig)
 })
 
 app.delete('/admin/apis/:id', async (c) => {
@@ -209,25 +300,31 @@ app.get('/api/health/data.json', async (c) => {
   return c.json({ updated: new Date().toISOString(), days })
 })
 
-// ── Public dynamic route ─────────────────────────────────────────
-// Matches any /:url slug registered in api_registry.
+// ── Public dynamic routes ────────────────────────────────────────
+// Match any /:url slug registered in api_registry.
+// GET /:url        → slot metadata (fetched by the world via VRCStringDownloader)
+// GET /:url/v/:n   → 302 to the video in slot n (baked into the world as a VRCUrl)
 
 app.get('/:url', async (c) => {
-  const urlParam = c.req.param('url')
-  const registry = (await c.env.PLAYLIST_STORE.get<ApiRegistry>('api_registry', 'json')) ?? { apis: [] }
-  const apiConfig = registry.apis.find(a => a.url === urlParam)
+  const playlist = await loadPlaylist(c.env, c.req.param('url'))
+  if (!playlist) return c.json({ error: 'Not found' }, 404)
 
-  if (!apiConfig) {
-    // Legacy fallback: serve from old 'playlists' key before migration
-    if (urlParam === 'playlists') {
-      const data = await c.env.PLAYLIST_STORE.get<PlaylistData>('playlists', 'json')
-      return c.json(data ?? { playlists: [] })
-    }
-    return c.json({ error: 'Not found' }, 404)
-  }
+  c.header('Cache-Control', 'no-store')
+  return c.json(toMetadata(playlist.data, playlist.slotCount))
+})
 
-  const data = await c.env.PLAYLIST_STORE.get(`data:${apiConfig.id}`, 'json')
-  return c.json(data ?? { playlists: [] })
+app.get('/:url/v/:slot', async (c) => {
+  const slotParam = c.req.param('slot')
+  if (!/^\d+$/.test(slotParam)) return c.json({ error: 'Not found' }, 404)
+
+  const playlist = await loadPlaylist(c.env, c.req.param('url'))
+  if (!playlist) return c.json({ error: 'Not found' }, 404)
+
+  const track = playlist.data.playlists.flatMap(p => p.tracks)[Number(slotParam)]
+  if (!track || !isPlayableUrl(track.url)) return c.json({ error: 'Empty slot' }, 404)
+
+  c.header('Cache-Control', 'no-store')
+  return c.redirect(track.url, 302)
 })
 
 export default app
