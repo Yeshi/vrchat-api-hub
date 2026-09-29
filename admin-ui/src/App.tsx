@@ -11,6 +11,7 @@ type ApiConfig = {
   name: string
   type: 'playlist'
   url: string
+  slotCount?: number
   createdAt: string
 }
 
@@ -23,12 +24,29 @@ const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api'
 
 const EMPTY_TRACK: Track = { title: '', url: '' }
 
+// Must match DEFAULT_SLOT_COUNT in api/src/index.tsx (used when an API has no slotCount)
+const DEFAULT_SLOT_COUNT = 20
+
+function parseSlotCount(v: string): number | null {
+  return /^[1-9]\d*$/.test(v.trim()) && Number.isSafeInteger(Number(v)) ? Number(v) : null
+}
+
 const STATUS_LABEL: Record<Status, string> = {
   loading: 'Loading...',
   ready: '',
   saving: 'Saving...',
   saved: '✓ Saved',
   error: '⚠ Error',
+}
+
+// Mirrors toMetadata() in api/src/index.tsx — what GET /{slug} returns to the world
+function toMetadata(playlists: Playlist[], slotCount: number) {
+  let slot = 0
+  const pls = playlists.map(p => ({
+    name: p.name,
+    tracks: p.tracks.map(t => ({ slot: slot++, title: t.title, empty: !/^https?:\/\/\S+$/.test(t.url) })),
+  }))
+  return { slotCount, usedSlots: slot, playlists: pls }
 }
 
 // ── UI Primitives ─────────────────────────────────────────────────
@@ -102,9 +120,11 @@ function PasswordGate({ onAuth }: { onAuth: (token: string) => void }) {
 
 function PlaylistEditor({
   initialData,
+  slotCount,
   onChange,
 }: {
   initialData: PlaylistData
+  slotCount: number
   onChange: (data: PlaylistData) => void
 }) {
   const [playlists, setPlaylists] = useState<Playlist[]>(() => initialData.playlists)
@@ -189,18 +209,25 @@ function PlaylistEditor({
 
   function confirmAddTrack() {
     if (!addTrackDraft.title && !addTrackDraft.url) return
+    if (slotsFull) return
     updateTracks(ts => [...ts, addTrackDraft])
     setAddingTrack(false)
     setAddTrackDraft(EMPTY_TRACK)
   }
 
   async function copyJson() {
-    await navigator.clipboard.writeText(JSON.stringify({ playlists }, null, 2))
+    await navigator.clipboard.writeText(JSON.stringify(toMetadata(playlists, slotCount), null, 2))
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
   }
 
   const selected = selectedPl !== null ? playlists[selectedPl] : null
+  // Slots are numbered sequentially across all playlists in display order
+  const usedSlots = playlists.reduce((sum, p) => sum + p.tracks.length, 0)
+  const slotOffset = selectedPl !== null
+    ? playlists.slice(0, selectedPl).reduce((sum, p) => sum + p.tracks.length, 0)
+    : 0
+  const slotsFull = usedSlots >= slotCount
 
   return (
     <div className="flex flex-col flex-1 min-h-0">
@@ -211,6 +238,12 @@ function PlaylistEditor({
             <span className="text-xs font-semibold text-(--text-h)">Playlists</span>
             <span className="text-xs text-(--text) bg-(--code-bg) border border-(--border) px-1.5 py-0.5 rounded-full leading-none">
               {playlists.length}
+            </span>
+            <span
+              className={`ml-auto text-xs font-mono ${slotsFull ? 'text-red-500' : 'text-(--text)'}`}
+              title="Used slots"
+            >
+              {usedSlots}/{slotCount}
             </span>
           </div>
           <ul className="flex-1 overflow-y-auto py-1">
@@ -290,7 +323,7 @@ function PlaylistEditor({
                   {selected.tracks.map((track, i) =>
                     editingTrack === i ? (
                       <li key={i} className="border border-(--accent-border) rounded-lg bg-(--code-bg) p-4 space-y-3">
-                        <div className="text-xs font-medium text-(--text)">Track {i + 1}</div>
+                        <div className="text-xs font-medium text-(--text)">Slot {slotOffset + i}</div>
                         <div>
                           <Label>Title</Label>
                           <TextInput autoFocus value={editTrackDraft.title} onChange={v => setEditTrackDraft(d => ({ ...d, title: v }))} placeholder="Track title" />
@@ -306,7 +339,7 @@ function PlaylistEditor({
                       </li>
                     ) : (
                       <li key={i} className="flex items-center gap-3 px-4 py-3 border border-(--border) rounded-lg hover:bg-(--code-bg) transition-colors group">
-                        <span className="text-xs font-mono text-(--text) w-5 text-right shrink-0">{i + 1}</span>
+                        <span className="text-xs font-mono text-(--text) w-8 text-right shrink-0" title="Slot">#{slotOffset + i}</span>
                         <div className="flex-1 min-w-0">
                           <div className="text-sm font-medium text-(--text-h) truncate">
                             {track.title || <span className="italic font-normal text-(--text)">No title</span>}
@@ -343,9 +376,10 @@ function PlaylistEditor({
                 ) : (
                   <button
                     onClick={() => { setEditingTrack(null); setAddingTrack(true); setAddTrackDraft(EMPTY_TRACK) }}
-                    className="mt-2 w-full py-3 border-2 border-dashed border-(--border) rounded-lg text-sm text-(--text) hover:border-(--accent) hover:text-(--accent) transition-colors"
+                    disabled={slotsFull}
+                    className="mt-2 w-full py-3 border-2 border-dashed border-(--border) rounded-lg text-sm text-(--text) hover:border-(--accent) hover:text-(--accent) transition-colors disabled:opacity-40 disabled:pointer-events-none"
                   >
-                    + Add Track
+                    {slotsFull ? `スロット上限 (${slotCount}) に達しています` : '+ Add Track'}
                   </button>
                 )}
               </section>
@@ -357,11 +391,11 @@ function PlaylistEditor({
       {/* ── JSON Preview ──────────────────────────────────── */}
       <section className="border-t border-(--border) p-6 shrink-0">
         <div className="flex items-center justify-between mb-3">
-          <span className="text-sm font-semibold text-(--text-h)">JSON Preview</span>
+          <span className="text-sm font-semibold text-(--text-h)">JSON Preview <span className="font-normal text-xs text-(--text)">(GET /slug)</span></span>
           <Btn variant="outline" small onClick={copyJson}>{copied ? '✓ Copied' : 'Copy'}</Btn>
         </div>
         <pre className="p-4 bg-(--code-bg) border border-(--border) rounded-lg text-xs font-mono text-(--text-h) overflow-x-auto leading-relaxed max-h-64 overflow-y-auto">
-          {JSON.stringify({ playlists }, null, 2)}
+          {JSON.stringify(toMetadata(playlists, slotCount), null, 2)}
         </pre>
       </section>
     </div>
@@ -446,6 +480,7 @@ function ApiListPage({
                 <th className="px-4 py-2.5 text-left text-xs font-medium text-(--text)">Name</th>
                 <th className="px-4 py-2.5 text-left text-xs font-medium text-(--text)">Type</th>
                 <th className="px-4 py-2.5 text-left text-xs font-medium text-(--text)">URL</th>
+                <th className="px-4 py-2.5 text-left text-xs font-medium text-(--text)">Slots</th>
                 <th className="px-4 py-2.5 text-left text-xs font-medium text-(--text)">Created</th>
                 <th className="px-4 py-2.5" />
               </tr>
@@ -463,6 +498,7 @@ function ApiListPage({
                     </span>
                   </td>
                   <td className="px-4 py-3 font-mono text-xs text-(--text)">/{api.url}</td>
+                  <td className="px-4 py-3 font-mono text-xs text-(--text)">{api.slotCount ?? DEFAULT_SLOT_COUNT}</td>
                   <td className="px-4 py-3 text-xs text-(--text)">
                     {new Date(api.createdAt).toLocaleDateString('ja-JP')}
                   </td>
@@ -505,14 +541,16 @@ function ApiCreatePage({
   const [name, setName] = useState('')
   const [url, setUrl] = useState('')
   const [urlError, setUrlError] = useState('')
+  const [slotCountInput, setSlotCountInput] = useState(String(DEFAULT_SLOT_COUNT))
   const [submitting, setSubmitting] = useState(false)
+  const slotCount = parseSlotCount(slotCountInput)
 
   function sanitizeUrl(v: string) {
     return v.toLowerCase().replace(/[^a-z0-9-_]/g, '-').replace(/--+/g, '-').replace(/^-|-$/g, '')
   }
 
   async function handleCreate() {
-    if (!name.trim() || !url.trim()) return
+    if (!name.trim() || !url.trim() || slotCount === null) return
     setSubmitting(true)
     setUrlError('')
     try {
@@ -522,7 +560,7 @@ function ApiCreatePage({
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ name: name.trim(), type: 'playlist', url: url.trim() }),
+        body: JSON.stringify({ name: name.trim(), type: 'playlist', url: url.trim(), slotCount }),
       })
       if (res.status === 401) { onUnauth(); return }
       if (res.status === 409) { setUrlError('この URL は既に使用されています'); return }
@@ -574,8 +612,20 @@ function ApiCreatePage({
           ) : null}
         </div>
 
+        <div>
+          <Label>Slots</Label>
+          <TextInput mono type="number" value={slotCountInput} onChange={setSlotCountInput} placeholder={String(DEFAULT_SLOT_COUNT)} />
+          {slotCount === null ? (
+            <div className="text-xs text-red-500 mt-1">1 以上の整数を入力してください</div>
+          ) : (
+            <div className="text-xs text-(--text) mt-1">
+              Unity に焼き込むスロットURLの数（/v/0 〜 /v/{slotCount - 1}）
+            </div>
+          )}
+        </div>
+
         <div className="flex gap-2 pt-2">
-          <Btn variant="primary" disabled={!name.trim() || !url.trim() || submitting} onClick={handleCreate}>
+          <Btn variant="primary" disabled={!name.trim() || !url.trim() || slotCount === null || submitting} onClick={handleCreate}>
             {submitting ? 'Creating...' : 'Create API'}
           </Btn>
           <Btn variant="outline" onClick={onBack}>Cancel</Btn>
@@ -604,6 +654,9 @@ function ApiDetailPage({
   const [loadError, setLoadError] = useState(false)
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [urlCopied, setUrlCopied] = useState(false)
+  const [slotCount, setSlotCount] = useState(config.slotCount ?? DEFAULT_SLOT_COUNT)
+  const [slotCountDraft, setSlotCountDraft] = useState(String(slotCount))
+  const [slotCountError, setSlotCountError] = useState('')
 
   useEffect(() => {
     onStatus('loading')
@@ -633,12 +686,36 @@ function ApiDetailPage({
           body: JSON.stringify(newData),
         })
         if (res.status === 401) { onUnauth(); return }
-        onStatus('saved')
+        onStatus(res.ok ? 'saved' : 'error')
       } catch {
         onStatus('error')
       }
     }, 800)
   }, [config.id, token])
+
+  async function commitSlotCount() {
+    const next = parseSlotCount(slotCountDraft)
+    if (next === slotCount) { setSlotCountDraft(String(slotCount)); setSlotCountError(''); return }
+    if (next === null) { setSlotCountError('1 以上の整数'); return }
+    try {
+      const res = await fetch(`${API_BASE}/admin/apis/${config.id}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ slotCount: next }),
+      })
+      if (res.status === 401) { onUnauth(); return }
+      if (res.status === 409) { setSlotCountError('登録済みの曲数より少なくできません'); return }
+      if (!res.ok) { setSlotCountError('更新に失敗しました'); return }
+      setSlotCount(next)
+      setSlotCountDraft(String(next))
+      setSlotCountError('')
+    } catch {
+      setSlotCountError('更新に失敗しました')
+    }
+  }
 
   async function copyPublicUrl() {
     await navigator.clipboard.writeText(`${API_BASE}/${config.url}`)
@@ -660,8 +737,22 @@ function ApiDetailPage({
         <span className="text-xs bg-(--accent-bg) text-(--accent) px-2 py-0.5 rounded-full font-medium shrink-0">
           {config.type}
         </span>
+        <div className="flex items-center gap-1.5">
+          <span className="text-xs text-(--text)">Slots</span>
+          <input
+            type="number"
+            min={1}
+            step={1}
+            value={slotCountDraft}
+            onChange={e => { setSlotCountDraft(e.target.value); setSlotCountError('') }}
+            onBlur={commitSlotCount}
+            onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur() }}
+            className={`w-20 px-2 py-0.5 text-xs font-mono bg-(--bg) border rounded text-(--text-h) focus:outline-none focus:border-(--accent) ${slotCountError ? 'border-red-500' : 'border-(--border)'}`}
+          />
+          {slotCountError && <span className="text-xs text-red-500">{slotCountError}</span>}
+        </div>
         <div className="flex items-center gap-1.5 ml-auto">
-          <span className="text-xs font-mono text-(--text)">GET /{config.url}</span>
+          <span className="text-xs font-mono text-(--text)">GET /{config.url} · /{config.url}/v/{'{slot}'}</span>
           <button
             onClick={copyPublicUrl}
             className="text-xs text-(--text) hover:text-(--accent) transition-colors px-2 py-0.5 border border-(--border) rounded"
@@ -682,7 +773,7 @@ function ApiDetailPage({
       )}
 
       {data !== null && (
-        <PlaylistEditor initialData={data} onChange={handleChange} />
+        <PlaylistEditor initialData={data} slotCount={slotCount} onChange={handleChange} />
       )}
     </div>
   )
