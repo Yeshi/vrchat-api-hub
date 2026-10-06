@@ -778,12 +778,14 @@ function ApiDetailPage({
         imported.push(...parseImportedJson(parsed, file.name))
       }
       if (imported.length === 0) throw new Error('プレイリストが入っていません')
+      if (!data) throw new Error('既存のプレイリストをまだ読み込めていません')
 
-      const trackCount = imported.reduce((sum, playlist) => sum + playlist.tracks.length, 0)
-      if (trackCount === 0) throw new Error('トラックが入っていません')
-      if (data && data.playlists.length > 0 && !window.confirm('現在のプレイリストを読み込んだJSONで置き換えますか？')) return
+      const importedTrackCount = imported.reduce((sum, playlist) => sum + playlist.tracks.length, 0)
+      if (importedTrackCount === 0) throw new Error('トラックが入っていません')
+      const nextData = { playlists: [...data.playlists, ...imported] }
+      const totalTrackCount = nextData.playlists.reduce((sum, playlist) => sum + playlist.tracks.length, 0)
 
-      const nextSlotCount = Math.max(slotCount, trackCount)
+      const nextSlotCount = Math.max(slotCount, totalTrackCount)
       if (nextSlotCount !== slotCount) {
         const slotResponse = await fetch(`${API_BASE}/admin/apis/${config.id}`, {
           method: 'PATCH',
@@ -794,7 +796,10 @@ function ApiDetailPage({
         if (!slotResponse.ok) throw new Error('スロット数の自動調整に失敗しました')
       }
 
-      const nextData = { playlists: imported }
+      if (saveTimer.current) {
+        clearTimeout(saveTimer.current)
+        saveTimer.current = null
+      }
       const response = await fetch(`${API_BASE}/admin/apis/${config.id}/data`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
