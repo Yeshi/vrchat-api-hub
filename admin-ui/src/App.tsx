@@ -31,6 +31,41 @@ function parseSlotCount(v: string): number | null {
   return /^[1-9]\d*$/.test(v.trim()) && Number.isSafeInteger(Number(v)) ? Number(v) : null
 }
 
+function isTrack(value: unknown): value is Track {
+  if (!value || typeof value !== 'object') return false
+  const track = value as Record<string, unknown>
+  return typeof track.title === 'string' && typeof track.url === 'string'
+}
+
+function isPlaylistData(value: unknown): value is PlaylistData {
+  if (!value || typeof value !== 'object') return false
+  const playlists = (value as Record<string, unknown>).playlists
+  return Array.isArray(playlists) && playlists.every(playlist => {
+    if (!playlist || typeof playlist !== 'object') return false
+    const candidate = playlist as Record<string, unknown>
+    return typeof candidate.name === 'string' && Array.isArray(candidate.tracks) && candidate.tracks.every(isTrack)
+  })
+}
+
+function playlistNameFromFile(filename: string): string {
+  const stem = filename.replace(/\.json$/i, '')
+  const match = stem.match(/^frenz(\d{4})(?:-(\d{4}))?$/i)
+  if (match) return match[2] ? `FRENZ ${match[1]}–${match[2]}` : `FRENZ ${match[1]}`
+  if (stem.toLowerCase() === 'frenz_opening') return 'FRENZ Opening'
+  return stem
+}
+
+function parseImportedJson(value: unknown, filename: string): Playlist[] {
+  if (isPlaylistData(value)) return value.playlists
+  if (value && typeof value === 'object') {
+    const tracks = (value as Record<string, unknown>).tracks
+    if (Array.isArray(tracks) && tracks.every(isTrack)) {
+      return [{ name: playlistNameFromFile(filename), tracks: tracks.map(({ title, url }) => ({ title, url })) }]
+    }
+  }
+  throw new Error(`${filename}: 対応しているプレイリストJSONではありません`)
+}
+
 const STATUS_LABEL: Record<Status, string> = {
   loading: 'Loading...',
   ready: '',
@@ -657,6 +692,10 @@ function ApiDetailPage({
   const [slotCount, setSlotCount] = useState(config.slotCount ?? DEFAULT_SLOT_COUNT)
   const [slotCountDraft, setSlotCountDraft] = useState(String(slotCount))
   const [slotCountError, setSlotCountError] = useState('')
+  const [importError, setImportError] = useState('')
+  const [importing, setImporting] = useState(false)
+  const [editorRevision, setEditorRevision] = useState(0)
+  const importInput = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     onStatus('loading')
@@ -723,6 +762,61 @@ function ApiDetailPage({
     setTimeout(() => setUrlCopied(false), 2000)
   }
 
+  async function importJson(files: FileList | null) {
+    if (!files?.length) return
+    setImportError('')
+    setImporting(true)
+    try {
+      const imported: Playlist[] = []
+      for (const file of Array.from(files)) {
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(await file.text())
+        } catch {
+          throw new Error(`${file.name}: JSONを読み取れません`)
+        }
+        imported.push(...parseImportedJson(parsed, file.name))
+      }
+      if (imported.length === 0) throw new Error('プレイリストが入っていません')
+
+      const trackCount = imported.reduce((sum, playlist) => sum + playlist.tracks.length, 0)
+      if (trackCount === 0) throw new Error('トラックが入っていません')
+      if (data && data.playlists.length > 0 && !window.confirm('現在のプレイリストを読み込んだJSONで置き換えますか？')) return
+
+      const nextSlotCount = Math.max(slotCount, trackCount)
+      if (nextSlotCount !== slotCount) {
+        const slotResponse = await fetch(`${API_BASE}/admin/apis/${config.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ slotCount: nextSlotCount }),
+        })
+        if (slotResponse.status === 401) { onUnauth(); return }
+        if (!slotResponse.ok) throw new Error('スロット数の自動調整に失敗しました')
+      }
+
+      const nextData = { playlists: imported }
+      const response = await fetch(`${API_BASE}/admin/apis/${config.id}/data`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify(nextData),
+      })
+      if (response.status === 401) { onUnauth(); return }
+      if (!response.ok) throw new Error('プレイリストの保存に失敗しました')
+
+      setSlotCount(nextSlotCount)
+      setSlotCountDraft(String(nextSlotCount))
+      setData(nextData)
+      setEditorRevision(revision => revision + 1)
+      onStatus('saved')
+    } catch (error) {
+      setImportError(error instanceof Error ? error.message : 'JSONの読み込みに失敗しました')
+      onStatus('error')
+    } finally {
+      setImporting(false)
+      if (importInput.current) importInput.current.value = ''
+    }
+  }
+
   return (
     <div className="flex flex-col flex-1 min-h-0">
       {/* ── Config bar ───────────────────────────────────── */}
@@ -759,8 +853,27 @@ function ApiDetailPage({
           >
             {urlCopied ? '✓' : 'Copy URL'}
           </button>
+          <input
+            ref={importInput}
+            type="file"
+            accept="application/json,.json"
+            multiple
+            className="hidden"
+            onChange={event => void importJson(event.target.files)}
+          />
+          <button
+            onClick={() => importInput.current?.click()}
+            disabled={importing || data === null}
+            className="text-xs text-(--text-h) hover:text-(--accent) transition-colors px-2 py-0.5 border border-(--border) rounded disabled:opacity-40"
+          >
+            {importing ? 'Importing…' : 'Import JSON'}
+          </button>
         </div>
       </div>
+
+      {importError && (
+        <div className="px-6 py-2 border-b border-(--border) text-xs text-red-500">{importError}</div>
+      )}
 
       {loadError && (
         <div className="flex flex-1 items-center justify-center text-sm text-red-500">
@@ -773,7 +886,7 @@ function ApiDetailPage({
       )}
 
       {data !== null && (
-        <PlaylistEditor initialData={data} slotCount={slotCount} onChange={handleChange} />
+        <PlaylistEditor key={editorRevision} initialData={data} slotCount={slotCount} onChange={handleChange} />
       )}
     </div>
   )
